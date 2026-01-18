@@ -1,67 +1,78 @@
 pipeline {
     agent any
 
-    tools {
-        jdk 'jdk17'
-        maven 'maven3'
+    environment {
+        JAVA_HOME = "/usr/lib/jvm/java-17-openjdk-amd64"
+        PATH = "${JAVA_HOME}/bin:${env.PATH}"
+
+        SONAR_PROJECT_KEY = "java-mini-project"
+        SONARQUBE_URL = "http://13.203.204.187:9000"
+
+        ARTIFACTORY_REPO_URL = "http://13.203.204.187:8081/artifactory/java-mini-project-local"
     }
 
     stages {
-        stage('Checkout Code') {
+
+        stage('Checkout') {
             steps {
-                git branch: 'jmp3',
-                    url: 'https://github.com/Suprith25/Jenkins-mini-project.git'
+                checkout scm
             }
         }
 
-        stage('Build') {
+        stage('SonarQube Analysis') {
             steps {
-                dir('sample-app') {
-                    sh 'mvn clean package -DskipTests'
+                withSonarQubeEnv('sonar-server') {
+                    withCredentials([
+                        string(credentialsId: 'sonar-token', variable: 'SONAR_TOKEN')
+                    ]) {
+                        sh '''
+                            mvn clean verify sonar:sonar \
+                            -Dsonar.projectKey=${SONAR_PROJECT_KEY}
+                        '''
+                    }
                 }
             }
         }
 
-        stage('Upload to JFrog') {
+        stage('Quality Gate') {
             steps {
-                withCredentials([usernamePassword(credentialsId: 'jfrog-creds',
-                                                 usernameVariable: 'JFROG_USER',
-                                                 passwordVariable: 'JFROG_PASS')]) {
-                    sh '''
-                        echo "Uploading WAR to JFrog..."
-                        WAR_FILE=$(ls sample-app/target/*.war)
-                        curl -u $JFROG_USER:$JFROG_PASS -T $WAR_FILE \
-                        "https://trial9krpxa.jfrog.io/artifactory/testrepo-generic-local/${JOB_NAME}-${BUILD_NUMBER}-sample.war"
-                    '''
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
                 }
             }
         }
 
-        stage('Deploy to Tomcat') {
+        stage('Build WAR') {
             steps {
-                sshagent (credentials: ['tomcat-ssh-key']) {
+                sh 'mvn clean package'
+            }
+        }
+
+        stage('Upload to Artifactory') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'jfrog-creds',
+                        usernameVariable: 'ART_USER',
+                        passwordVariable: 'ART_PASS'
+                    )
+                ]) {
                     sh '''
-                        echo "Deploying WAR to Tomcat server..."
-
-                        WAR_FILE=$(ls sample-app/target/*.war)
-                        SERVER_IP=172.31.7.137
-                        SERVER_USER=ubuntu
-                        TOMCAT_DIR=/opt/tomcat/webapps
-
-                        # Copy WAR file to /tmp first (where ubuntu has access)
-                        scp -o StrictHostKeyChecking=no $WAR_FILE $SERVER_USER@$SERVER_IP:/tmp/
-
-                        # Move WAR into Tomcat webapps with sudo
-                        ssh -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_IP "sudo mv /tmp/$(basename $WAR_FILE) $TOMCAT_DIR/"
-
-                        # Restart Tomcat service
-                        ssh -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_IP "sudo systemctl restart tomcat"
-
-                        echo "Deployment completed successfully!"
+                        curl -u ${ART_USER}:${ART_PASS} \
+                        -T target/*.war \
+                        ${ARTIFACTORY_REPO_URL}/
                     '''
                 }
             }
         }
     }
-}
 
+    post {
+        success {
+            echo "Pipeline completed successfully"
+        }
+        failure {
+            echo "Pipeline failed"
+        }
+    }
+}
